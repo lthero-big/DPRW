@@ -1,6 +1,8 @@
 # Diversity-Preserving Robust Watermarking (DPRW)
 
-This repository provides the reference implementation of the paper *"Diversity-Preserving Robust Watermarking for Diffusion Model Generated Images"*. Our project aims to embed watermarks into the latent noise space of diffusion models, striking a balance between image fidelity and diversity while maintaining high robustness against common image distortions (e.g., Gaussian noise, JPEG compression, resizing, cropping).
+This repository provides the reference implementation of the paper *"Diversity-Preserving Robust Watermarking for Diffusion Model Generated Images"*. 
+
+Our project aims to embed watermarks into the latent noise space of diffusion models, striking a balance between image fidelity and diversity while maintaining high robustness against common image distortions (e.g., Gaussian noise, JPEG compression, resizing, cropping).
 
 ## Features
 
