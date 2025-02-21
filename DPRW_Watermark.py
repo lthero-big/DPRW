@@ -192,24 +192,34 @@ class DPRW_WatermarkEmbed(Common):
         return binary_flat
 
 
-    def __ReMappingToGaussianNoise(self, binary_matrix:np.ndarray) -> np.ndarray:
+    def __ReMappingToGaussianNoise(self, binary_matrix: np.ndarray) -> np.ndarray:
         Z_T_array = self.initialNoise.clone().cpu().numpy()
         for ch in range(self.channel):
             for i in range(self.height_blocks):
                 for j in range(self.width_blocks):
-                    original_cdf_value = norm.cdf(self.initialNoise_cpu[self.fix_batchsize-1,ch, i, j])
+                    original_cdf_value = norm.cdf(self.initialNoise_cpu[self.fix_batchsize-1, ch, i, j])
                     binary_value = binary_matrix[ch, i, j]
-                    original_binary_value=original_cdf_value > 0.5
+                    original_binary_value = original_cdf_value > 0.5
                     
                     if binary_value != original_binary_value:
                         if self.use_seed == 0:
-                            u = np.random.uniform(0, 1)
+                            u = np.random.uniform(0, 0.5 - 1e-8)
                         else:
-                            u = self.rng.uniform(0, 1)
-                        Z_T_array[self.fix_batchsize-1,ch, i, j] = norm.ppf((u + binary_value) / 2**1)
+                            u = self.rng.uniform(0, 0.5 - 1e-8)
+                        theta_i = u + binary_value * 0.5
+                        Z_T_array[self.fix_batchsize-1, ch, i, j] = norm.ppf(theta_i)
 
+        noise_samples = Z_T_array.flatten()
+        if np.isnan(noise_samples).any() or np.isinf(noise_samples).any():
+            raise ValueError("NaN or Inf value")
+        if np.var(noise_samples) == 0:
+            raise ValueError("var is zero!")
+        
+        D, p_value = kstest(noise_samples, 'norm', args=(0, 1))
+        if np.isnan(p_value) or p_value < 0.05:
+            raise ValueError(f"Error (p={p_value:.4f})")
+        
         return Z_T_array
-
 
     def __LogINfo(self):
         self.LogInfo('WatermarkEmbed', 'Key_hex', self.key.hex())
