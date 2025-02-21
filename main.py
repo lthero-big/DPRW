@@ -4,9 +4,7 @@ from DPRW_Watermark import DPRW_WatermarkAccuracy
 
 
 
-# 主函数
 def main():
-    """测试主函数"""
     config = {
         'image_height': 1024,
         'image_width': 1024,
