@@ -1,355 +1,201 @@
 import numpy as np
+import torch
+import os
+import logging
+from typing import Tuple, Optional, List
+from scipy.stats import norm, kstest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.backends import default_backend
 from datetime import datetime
-import os
-from scipy.stats import norm
-import torch
-import json
-import logging
-import time
-
 
 class Loggers:
-    def __init__(self, logger_file_path: str):
-        self.logger_file_path = logger_file_path
-
-    def create_logger(self) -> logging.Logger:
-        # make dir if not exists
-        if not os.path.exists(self.logger_file_path):
-            os.makedirs(self.logger_file_path)
-
-        log_name = '{}.log'.format(time.strftime('%Y-%m-%d-%H-%M'))
-        final_log_file = os.path.join(self.logger_file_path, log_name)
-
-        logger = logging.getLogger()  
-        if logger.hasHandlers():
-            print("clear logger handlers")
-            logger.handlers.clear()
-        logger.setLevel(logging.INFO)  # DEBUG/ERROR etc.
-
-        file_handler = logging.FileHandler(final_log_file, mode='a', encoding='utf-8')
-        console_handler = logging.StreamHandler()
-
-        formatter = logging.Formatter(
-            "%(asctime)s %(levelname)s: %(message)s "
-        )
-        file_handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
-
-        logger.addHandler(file_handler)
-        logger.addHandler(console_handler)
-
-        return logger 
-
-class Common:
     _logger = None
 
-    def __init__(self, device:str ='cpu', logger_file_path:str='./logs'):
-        self.device = device
-        if Common._logger is None:
-            Common._logger = Loggers(logger_file_path).create_logger()
+    @classmethod
+    def get_logger(cls, log_dir: str = './logs') -> logging.Logger:
+        if cls._logger is None:
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir)
+            log_file = os.path.join(log_dir, f'{datetime.now().strftime("%Y-%m-%d-%H-%M")}.log')
+            cls._logger = logging.getLogger('WatermarkLogger')
+            cls._logger.setLevel(logging.INFO)
+            cls._logger.handlers.clear() 
+            formatter = logging.Formatter("%(asctime)s %(levelname)s: [%(name)s] %(message)s")
+            file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+            console_handler = logging.StreamHandler()
+            file_handler.setFormatter(formatter)
+            console_handler.setFormatter(formatter)
+            cls._logger.addHandler(file_handler)
+            cls._logger.addHandler(console_handler)
+        return cls._logger
 
-    @property
-    def logger(self) -> logging.Logger:
-        return Common._logger
-    
-    def LogInfo(self, ModuleName:str, MessageKey:str, MessageValue:str):
-        self.logger.info(f'[{ModuleName}] {MessageKey}: {MessageValue}')
+class WatermarkBase:
+    def __init__(self, device: str = 'cpu', log_dir: str = './logs'):
+        self.device = torch.device(device)
+        self.logger = Loggers.get_logger(log_dir)
 
-    def LogWarning(self, ModuleName:str, MessageKey:str, MessageValue:str):
-        self.logger.warning(f'[{ModuleName}] {MessageKey}: {MessageValue}')
+    def _log(self, level: str, module: str, key: str, value: str):
+        getattr(self.logger, level)(f"[{module}] {key}: {value}")
 
-    def LogError(self, ModuleName:str, MessageKey:str, MessageValue:str):
-        self.logger.error(f'[{ModuleName}] {MessageKey}: {MessageValue}')
+    def log_info(self, module: str, key: str, value: str):
+        self._log('info', module, key, value)
 
+    def log_warning(self, module: str, key: str, value: str):
+        self._log('warning', module, key, value)
 
-class DPRW_WatermarkEmbed(Common):
-    def __init__(self, key_hex:str=None, nonce_hex:str=None, use_seed:int=0, 
-                random_seed:int=42, device:str ='cpu', logger_file_path:str='./logs'):
-        super().__init__(device, logger_file_path)
-        self.key_hex = key_hex
-        self.nonce_hex = nonce_hex
+    def log_error(self, module: str, key: str, value: str):
+        self._log('error', module, key, value)
+
+class DPRW_WatermarkEmbed(WatermarkBase):
+    def __init__(self, key_hex: Optional[str] = None, nonce_hex: Optional[str] = None,
+                 use_seed: bool = False, random_seed: int = 42,
+                 device: str = 'cpu', log_dir: str = './logs'):
+        super().__init__(device, log_dir)
         self.use_seed = use_seed
         self.random_seed = random_seed
-        self.ParamsNeedReturn=[]
-        self.__initRandomSeed()
-        self.__initKeyAndNonce()
-        
-    def __is_valid_hex(self,string:str, expected_length:int):
-            if not isinstance(string, str):
-                return False
-            if len(string) != expected_length:
-                return False
-            try:
-                bytes.fromhex(string)
-                return True
-            except ValueError:
-                return False
+        self.rng = np.random.RandomState(random_seed) if use_seed else np.random
+        self.key, self.nonce = self._init_crypto(key_hex, nonce_hex)
 
-    def __initRandomSeed(self):
-        if self.use_seed == 1:
-            self.rng = np.random.RandomState(seed=self.random_seed)
-    
-    def __initKeyAndNonce(self):
-        if not self.__is_valid_hex(self.key_hex, 64):
-            self.LogWarning("WatermarkEmbed",f"Invalid key_hex",f"{self.key_hex}, generating random key")
-            self.key=os.urandom(32)
-            self.key_hex=self.key.hex()
-            self.ParamsNeedReturn.append(self.key)
-        else:
-            self.key = bytes.fromhex(self.key_hex)
-            
-        if not self.__is_valid_hex(self.nonce_hex, 32):
-            self.LogWarning("WatermarkEmbed",f"Invalid nonce_hex",f"{self.nonce_hex}, generating random nonce")
-            self.nonce=os.urandom(16)
-            self.nonce_hex=self.nonce.hex()
-            self.ParamsNeedReturn.append(self.nonce)
-        else:
-            self.nonce = bytes.fromhex(self.nonce_hex)
+    def _init_crypto(self, key_hex: Optional[str], nonce_hex: Optional[str]) -> Tuple[bytes, bytes]:
+        key = self._validate_hex(key_hex, 64, 'key_hex', os.urandom(32))
+        nonce = self._validate_hex(nonce_hex, 32, 'nonce_hex', os.urandom(16))
+        return key, nonce
 
-    def __initMessage(self,total_blocks_needed:int, message_length:int=-1) -> bytes:
-        if message_length != -1:
-            watermark_length_bits = message_length
-        else:
-            watermark_length_bits = 128
+    def _validate_hex(self, hex_str: Optional[str], length: int, name: str, default: bytes) -> bytes:
+        if hex_str and len(hex_str) == length and all(c in '0123456789abcdefABCDEF' for c in hex_str):
+            return bytes.fromhex(hex_str)
+        self.log_warning("WatermarkEmbed", f"Invalid {name}", f"{hex_str}, generating random value")
+        return default
 
-        length_of_msg_bytes = watermark_length_bits // 8
-        
-        if self.message:
-            message_bytes = str(self.message).encode()
-            if len(message_bytes) < length_of_msg_bytes:
-                padded_message = message_bytes + b'\x00' * (length_of_msg_bytes - len(message_bytes))
-            else:
-                padded_message = message_bytes[:length_of_msg_bytes]
-        else:
-            padded_message = os.urandom(length_of_msg_bytes)
+    def _create_watermark(self, total_blocks: int, message: str, message_length: int) -> bytes:
+        length_bits = message_length if message_length > 0 else 128
+        length_bytes = length_bits // 8
+        msg_bytes = message.encode('utf-8')
+        padded_msg = msg_bytes.ljust(length_bytes, b'\x00')[:length_bytes]
+        repeats = total_blocks // length_bits
+        watermark = padded_msg * repeats + b'\x00' * ((total_blocks % length_bits) // 8)
+        self.log_info("WatermarkEmbed", "Watermark repeats", str(repeats))
+        return watermark
 
-        repeats = total_blocks_needed // watermark_length_bits
-        self.LogInfo("WatermarkEmbed",f"repeats",repeats)
-
-        watermark_bytes = padded_message * repeats
-        remaining_bits = total_blocks_needed * 8 - repeats * watermark_length_bits
-        if remaining_bits > 0:
-            watermark_bytes += b'\x00' * (remaining_bits // 8)
-
-        return watermark_bytes
-    
-
-    def __EncryptMessage(self, watermark_bytes:bytes) -> str:
+    def _encrypt(self, watermark: bytes) -> str:
         cipher = Cipher(algorithms.ChaCha20(self.key, self.nonce), mode=None, backend=default_backend())
         encryptor = cipher.encryptor()
-        m = encryptor.update(watermark_bytes) + encryptor.finalize()
-        m_bits = ''.join(format(byte, '08b') for byte in m)
-        return m_bits
+        encrypted = encryptor.update(watermark) + encryptor.finalize()
+        return ''.join(format(byte, '08b') for byte in encrypted)
+
+    def _binarize_noise(self, noise: torch.Tensor) -> np.ndarray:
+        noise_np = noise.cpu().numpy()[-1] 
+        return (norm.cdf(noise_np) > 0.5).astype(np.uint8).flatten()
+
+    def _embed_bits(self, binary: np.ndarray, bits: str, window_size: int) -> np.ndarray:
+        binary = binary.copy()
+        for i in range(0, len(binary), window_size):
+            window_end = min(i + window_size, len(binary))
+            window_sum = np.sum(binary[i:window_end])
+            bit_idx = i // window_size
+            if bit_idx < len(bits):
+                target_parity = int(bits[bit_idx])
+                if window_sum % 2 != target_parity:
+                    mid_idx = i + (window_end - i) // 2
+                    if mid_idx < len(binary):
+                        binary[mid_idx] = 1 - binary[mid_idx]
+        return binary
+
+    def _restore_noise(self, binary: np.ndarray, shape: Tuple[int, ...]) -> torch.Tensor:
+        noise_np = np.zeros(shape[1:], dtype=np.float32) 
+        binary_reshaped = binary.reshape(shape[1:])
+        for c in range(shape[1]):
+            for h in range(shape[2]):
+                for w in range(shape[3]):
+                    u = self.rng.uniform(0, 0.5 - 1e-8)
+                    theta = u + binary_reshaped[c, h, w] * 0.5
+                    noise_np[c, h, w] = norm.ppf(theta)
+
+        samples = noise_np.flatten()
+        _, p_value = kstest(samples, 'norm', args=(0, 1))
+        if p_value < 0.05:
+            raise ValueError(f"Restored noise failed Gaussian test (p={p_value:.4f})")
+        self.log_info("WatermarkEmbed", "Gaussian test passed", f"p={p_value:.4f}")
+        return torch.tensor(noise_np, dtype=torch.float32, device=self.device)
+
+    def embed(self, noise: torch.Tensor, message: str, message_length: int = -1, window_size: int = 1) -> Tuple[torch.Tensor, List[bytes]]:
+        total_blocks = noise.numel() // (noise.shape[0] * window_size)
+        watermark = self._create_watermark(total_blocks, message, message_length)
+        encrypted_bits = self._encrypt(watermark)
+        binary = self._binarize_noise(noise)
+        binary_embedded = self._embed_bits(binary, encrypted_bits, window_size)
+        restored_noise = self._restore_noise(binary_embedded, noise.shape)
+        self.log_info("WatermarkEmbed", "Key", self.key.hex())
+        self.log_info("WatermarkEmbed", "Nonce", self.nonce.hex())
+        self.log_info("WatermarkEmbed", "Message", message)
+        return restored_noise, [self.key, self.nonce]
 
 
-    def __NoiseToBinary(self) -> np.ndarray:
-        self.initialNoise_cpu = self.initialNoise.cpu().numpy()
-        binary_matrix = (norm.cdf(self.initialNoise_cpu) > 0.5).astype(int)
-        binary_matrix = binary_matrix[self.fix_batchsize - 1]
-
-        binary_flat = binary_matrix.flatten()
-        return binary_flat
-
-
-    def __CoreMethod(self, binary_flat:np.ndarray, m_bits:str, total_blocks_needed:int) -> np.ndarray:
-        bit_idx = 0
-        total_m_bits = len(m_bits)
-        count_fix_nums = 0
-        total_elements = len(binary_flat)
-
-        # self.LogInfo("total_elements",total_elements)
-        # self.LogInfo("total_m_bits",total_m_bits)
-
-        for i in range(0, total_elements, self.window_size):
-            window_end = min(i + self.window_size, total_elements)  
-            window_sum = np.sum(binary_flat[i:window_end])
-
-            target_sum = window_sum
-            if bit_idx < total_m_bits:
-                if int(m_bits[bit_idx]) == 0:
-                    if window_sum % 2 != 0:
-                        target_sum -= 1
-                else:
-                    if window_sum % 2 == 0:
-                        target_sum += 1
-
-            if target_sum != window_sum:
-                count_fix_nums += 1
-
-                mid_index = i + (self.window_size // 2)  
-
-                if window_end - i < self.window_size:
-                    mid_index = i  
-
-                if mid_index < total_elements:
-                    binary_flat[mid_index] = 1 - binary_flat[mid_index]
-
-            if bit_idx < total_m_bits:
-                bit_idx += 1
-
-        return binary_flat
-
-
-    def __ReMappingToGaussianNoise(self, binary_matrix: np.ndarray) -> np.ndarray:
-        Z_T_array = self.initialNoise.clone().cpu().numpy()
-        for ch in range(self.channel):
-            for i in range(self.height_blocks):
-                for j in range(self.width_blocks):
-                    original_cdf_value = norm.cdf(self.initialNoise_cpu[self.fix_batchsize-1, ch, i, j])
-                    binary_value = binary_matrix[ch, i, j]
-                    original_binary_value = original_cdf_value > 0.5
-                    
-                    if binary_value != original_binary_value:
-                        if self.use_seed == 0:
-                            u = np.random.uniform(0, 0.5 - 1e-8)
-                        else:
-                            u = self.rng.uniform(0, 0.5 - 1e-8)
-                        theta_i = u + binary_value * 0.5
-                        Z_T_array[self.fix_batchsize-1, ch, i, j] = norm.ppf(theta_i)
-
-        noise_samples = Z_T_array.flatten()
-        if np.isnan(noise_samples).any() or np.isinf(noise_samples).any():
-            raise ValueError("NaN or Inf value")
-        if np.var(noise_samples) == 0:
-            raise ValueError("var is zero!")
-        
-        D, p_value = kstest(noise_samples, 'norm', args=(0, 1))
-        if np.isnan(p_value) or p_value < 0.05:
-            raise ValueError(f"Error (p={p_value:.4f})")
-        
-        return Z_T_array
-
-    def __LogINfo(self):
-        self.LogInfo('WatermarkEmbed', 'Key_hex', self.key.hex())
-        self.LogInfo('WatermarkEmbed', 'Oonce_hex',self.nonce.hex())
-        self.LogInfo('WatermarkEmbed', 'Message',self.message)
-        self.LogInfo('WatermarkEmbed', 'Setting message_length', self.message_length)
-        self.LogInfo('WatermarkEmbed', 'RandomSeed',self.random_seed)
-
-
-    def GetWatermarkedNoise(self, 
-                       initial_noise: torch.Tensor, 
-                       message: str,
-                       message_length: int=-1, 
-                       window_size: int=1, 
-                       fix_batchsize: int=1
-                       ) -> (torch.Tensor,list):
-
-        self.initialNoise = initial_noise
-        self.message = message
-        self.message_length=message_length
-        self.fix_batchsize = fix_batchsize
-        self.channel = initial_noise.shape[1]
-        self.window_size = window_size
-    
-
-        self.width_blocks = initial_noise.shape[-1] #image_width // 8
-        self.height_blocks = initial_noise.shape[-2] #image_height // 8
-        total_blocks_needed = self.channel * self.width_blocks * self.height_blocks // window_size
-
-        watermark_bytes = self.__initMessage(total_blocks_needed, message_length)
-
-        m_bits = self.__EncryptMessage(watermark_bytes)
-
-        binary_flat = self.__NoiseToBinary()
-
-        binary_flat = self.__CoreMethod(binary_flat, m_bits, total_blocks_needed)
-
-        binary_matrix = binary_flat.reshape((self.channel, self.height_blocks, self.width_blocks))
-
-        Z_T_array = self.__ReMappingToGaussianNoise(binary_matrix)
-
-        self.__LogINfo()
-    
-
-        return torch.tensor(Z_T_array[0], dtype=torch.float32, device=self.device),self.ParamsNeedReturn
-
-    
-
-class DPRW_WatermarkExtract(Common):
-    def __init__(self, key_hex:str=None, nonce_hex:str=None, device:str ='cpu', logger_file_path:str='./logs'):
-        super().__init__(device, logger_file_path)
+class DPRW_WatermarkExtract(WatermarkBase):
+    def __init__(self, key_hex: str, nonce_hex: str, device: str = 'cpu', log_dir: str = './logs'):
+        super().__init__(device, log_dir)
         self.key = bytes.fromhex(key_hex)
         self.nonce = bytes.fromhex(nonce_hex)
 
-    
-    def GetMessageFromLatents(self, 
-                             reversed_latents: torch.Tensor, 
-                             message_length: int, 
-                             window_size: int) -> str:
-
+    def _decrypt(self, encrypted: bytes) -> bytes:
         cipher = Cipher(algorithms.ChaCha20(self.key, self.nonce), mode=None, backend=default_backend())
         decryptor = cipher.decryptor()
+        return decryptor.update(encrypted) + decryptor.finalize()
 
-        binary_matrix = (norm.cdf(reversed_latents.cpu().numpy()) > 0.5).astype(int)
-        binary_flat = binary_matrix.flatten()
-        total_elements = len(binary_flat)
+    def extract(self, noise: torch.Tensor, message_length: int, window_size: int) -> Tuple[str, str]:
+        binary = (norm.cdf(noise.cpu().numpy()) > 0.5).astype(np.uint8).flatten()
+        bits = [str(int(np.sum(binary[i:i + window_size]) % 2)) 
+                for i in range(0, len(binary), window_size)]
+        bit_str = ''.join(bits)
+        byte_data = bytes(int(bit_str[i:i + 8], 2) for i in range(0, len(bit_str) - 7, 8))
+        decrypted = self._decrypt(byte_data)
+        all_bits = ''.join(format(byte, '08b') for byte in decrypted)
 
-        reconstructed_bits = []
-        for i in range(0, total_elements, window_size):
-            window_end = min(i + window_size, total_elements)
-            window_sum = np.sum(binary_flat[i:window_end])
-            y_reconstructed = 1 if window_sum % 2 != 0 else 0
-            reconstructed_bits.append(y_reconstructed)
+        segments = [all_bits[i:i + message_length] for i in range(0, len(all_bits) - message_length + 1, message_length)]
+        msg_bin = ''.join('1' if sum(s[i] == '1' for s in segments) > len(segments) / 2 else '0' 
+                          for i in range(message_length))
+        msg = bytes(int(msg_bin[i:i + 8], 2) for i in range(0, len(msg_bin), 8)).decode('utf-8', errors='replace')
+        self.log_info("WatermarkExtract", "Extracted binary", msg_bin)
+        self.log_info("WatermarkExtract", "Extracted message", msg)
+        return msg_bin, msg
 
-        extracted_binary_str = ''.join(str(bit) for bit in reconstructed_bits)
-        extracted_bytes = []
-        for i in range(0, len(extracted_binary_str), 8):
-            chunk = extracted_binary_str[i:i + 8]
-            extracted_bytes.append(int(chunk, 2))
-        decrypted_bytes = decryptor.update(bytes(extracted_bytes)) + decryptor.finalize()
-
-        all_bits = ''.join(format(byte, '08b') for byte in decrypted_bytes)
-
-        segment_count = len(all_bits) // message_length
-        segments = [all_bits[i:i + message_length] 
-                    for i in range(0, segment_count * message_length, message_length)]
-
-        reconstructed_message_bin = ''
-        for i in range(message_length):
-            count_1 = sum(segment[i] == '1' for segment in segments)
-            if count_1 > len(segments) / 2:
-                reconstructed_message_bin += '1'
-            else:
-                reconstructed_message_bin += '0'
-
-        try:
-            extracted_message = bytes(int(reconstructed_message_bin[i:i+8], 2) 
-                                      for i in range(0, len(reconstructed_message_bin), 8)).decode('utf-8', errors='replace')
-        except ValueError:
-            extracted_message = "<Decoding Error>"
-
-        self.LogInfo("WatermarkExtract",f"Reconstructed_message_bin",reconstructed_message_bin)
-        self.LogInfo("WatermarkExtract",f"Extracted_message",extracted_message)
-
-        return reconstructed_message_bin, extracted_message
+class DPRW_WatermarkAccuracy(WatermarkBase):
+    def evaluate(self, original_msg: str, extracted_bin: str) -> float:
+        orig_bin = bin(int(original_msg.encode('utf-8').hex(), 16))[2:].zfill(len(original_msg) * 8)
+        min_len = min(len(orig_bin), len(extracted_bin))
+        orig_bin, extracted_bin = orig_bin[:min_len], extracted_bin[:min_len]
+        accuracy = sum(a == b for a, b in zip(orig_bin, extracted_bin)) / min_len
+        self.log_info("WatermarkAccuracy", "Original binary", orig_bin)
+        self.log_info("WatermarkAccuracy", "Extracted binary", extracted_bin)
+        self.log_info("WatermarkAccuracy", "Bit accuracy", f"{accuracy:.4f}")
+        return accuracy
 
 
-class DPRW_WatermarkAccuracy(Common):
-    def __init__(self, logger_file_path:str='./logs'):
-        super().__init__(logger_file_path)
-    
-    def calculate_bit_accuracy(self,original_message: str, extracted_message_bin: str) -> (str, str, float):
-        original_message_hex = original_message.encode('utf-8').hex()
-        original_message_bin = bin(int(original_message_hex, 16))[2:].zfill(len(original_message_hex) * 4)
-        min_length = min(len(original_message_bin), len(extracted_message_bin))
-        original_message_bin, extracted_bin = original_message_bin[:min_length], extracted_message_bin[:min_length]
+def main():
+    config = {
+        'image_height': 1024,
+        'image_width': 1024,
+        'channel': 4,
+        'message': "lthero",
+        'message_length': 256,
+        'window_size': 1,
+        'random_seed': 42,
+        'use_seed': True,
+        'device': 'cpu',
+        'log_dir': './logs',
+        "key_hex":"5822ff9cce6772f714192f43863f6bad1bf54b78326973897e6b66c3186b77a7",
+        "nonce_hex":"05072fd1c2265f6f2e2a4080a2bfbdd8"
+    }
 
-        matching_bits = sum(x == y for x, y in zip(original_message_bin, extracted_bin))
-        bit_accuracy = matching_bits / min_length if min_length else 0.0
+    noise = torch.randn(1, config['channel'], config['image_height'] // 8, config['image_width'] // 8)
+    embedder = DPRW_WatermarkEmbed(use_seed=config['use_seed'], key_hex=config['key_hex'] ,nonce_hex=config['nonce_hex'],random_seed=config['random_seed'], device=config['device'])
+    watermarked_noise, params = embedder.embed(noise, config['message'], config['message_length'], config['window_size'])
+    key_hex, nonce_hex = params[0].hex(), params[1].hex()
 
-        try:
-            extracted_message = bytes(int(extracted_bin[i:i+8], 2) 
-                                      for i in range(0, len(extracted_bin), 8)).decode('utf-8', errors='replace')
-        except ValueError:
-            extracted_message = "<Decoding Error>"
+    extractor = DPRW_WatermarkExtract(key_hex, nonce_hex, config['device'])
+    extracted_bin, extracted_msg = extractor.extract(watermarked_noise, config['message_length'], config['window_size'])
 
-        self.LogInfo("WatermarkAccuracy",f"Original_message_bin  ",original_message_bin)
-        self.LogInfo("WatermarkAccuracy",f"Extracted_message_bin ",extracted_bin)
-        self.LogInfo("WatermarkAccuracy",f"Bit_accuracy",bit_accuracy)   
+    accuracy = DPRW_WatermarkAccuracy().evaluate(config['message'], extracted_bin)
 
-        return bit_accuracy
-
-
+if __name__ == "__main__":
+    main()
