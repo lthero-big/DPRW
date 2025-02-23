@@ -113,9 +113,6 @@ print(f"Extracted message: {extracted_msg}, Bit accuracy: {accuracy}")
 * 对于 DPMS-INV 调度器，需确保 src.stable_diffusion.inverse_stable_diffusion 可用。
 * 日志文件保存在 log_dir 指定的目录中。
 
-##扩展
-* 修改 _init_pipeline 以支持其他调度器。
-* 在 generate_image 中添加更多生成参数（如负提示词）。
 
 
 
