@@ -4,31 +4,41 @@ from DPRW_Watermark import DPRW_WatermarkAccuracy
 
 
 
-def main():
-    config = {
-        'image_height': 1024,
-        'image_width': 1024,
-        'channel': 4,
-        'message': "lthero",
-        'message_length': 256,
-        'window_size': 1,
-        'random_seed': 42,
-        'use_seed': True,
-        'device': 'cpu',
-        'log_dir': './logs',
-        "key_hex":"5822ff9cce6772f714192f43863f6bad1bf54b78326973897e6b66c3186b77a7",
-        "nonce_hex":"05072fd1c2265f6f2e2a4080a2bfbdd8"
-    }
+def example_usage():
+    engine = DPRW_Engine(
+        # digiplay/majicMIX_realistic_v7
+        # stabilityai/stable-diffusion-2-1-base
+        model_id="digiplay/majicMIX_realistic_v7",
+        scheduler_type="DDIM",
+        key_hex="5822ff9cce6772f714192f43863f6bad1bf54b78326973897e6b66c3186b77a7",
+        nonce_hex="05072fd1c2265f6f2e2a4080a2bfbdd8",
+        use_seed=True,
+        random_seed=42,
+        dtype=torch.float32,
+        device="cuda"  
+    )
+    fix_batchsize = 1
+    message = "5822ff9cce6772f714192f43863f6bad1bf54b78326973897e6b66c3186b77a7"
+    width, height = 1024, 1024
+    message_length = len(message)*8
+    window_size = 1
+    num_steps = 30
+    generated_image_path = "output/generated_image.png"
 
-    noise = torch.randn(1, config['channel'], config['image_height'] // 8, config['image_width'] // 8)
-    embedder = DPRW_WatermarkEmbed(use_seed=config['use_seed'], key_hex=config['key_hex'] ,nonce_hex=config['nonce_hex'],random_seed=config['random_seed'], device=config['device'])
-    watermarked_noise, params = embedder.embed(noise, config['message'], config['message_length'], config['window_size'])
-    key_hex, nonce_hex = params[0].hex(), params[1].hex()
+    prompt = "One girl in a white sweater at Times Square"
+    engine.generate_image(
+        prompt=prompt, width=width, height=height, num_steps=num_steps,
+        message=message, message_length=message_length, window_size=window_size,fix_batchsize=1,
+        output_path=generated_image_path
+    )
 
-    extractor = DPRW_WatermarkExtract(key_hex, nonce_hex, config['device'])
-    extracted_bin, extracted_msg = extractor.extract(watermarked_noise, config['message_length'], config['window_size'])
-
-    accuracy = DPRW_WatermarkAccuracy().evaluate(config['message'], extracted_bin)
-
+    reversed_latents = engine.invert_image(generated_image_path, width=width, 
+                                           height=height, 
+                                           num_steps=30, 
+                                           guidance_scale=7.5)
+    extracted_bin, extracted_msg = engine.extract_watermark(reversed_latents, 
+                                                            message_length=message_length, 
+                                                            window_size=window_size)
+    accuracy = engine.evaluate_accuracy(message, extracted_bin,extracted_msg)
 if __name__ == "__main__":
-    main()
+    example_usage()
