@@ -1,8 +1,3 @@
-'''
-DPRW水印引擎
-全局使用float32，提高精度但降低速度
-
-'''
 import argparse
 import os
 import glob
