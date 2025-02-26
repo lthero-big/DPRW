@@ -48,7 +48,7 @@ class DPRW_Engine:
     def __init__(self, model_id: str = 'stabilityai/stable-diffusion-2-1-base', scheduler_type: str = 'DDIM',
                  key_hex: Optional[str] = None, nonce_hex: Optional[str] = None,
                  use_seed: bool = False, random_seed: int = 42, device: str = 'cuda',
-                 dtype: torch.dtype = torch.float32, solver_order: int = 2, inv_order: int = 0,
+                 dtype: torch.dtype = torch.float16, solver_order: int = 2, inv_order: int = 0,
                  log_dir: str = './logs'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.dtype = dtype
@@ -135,7 +135,25 @@ class DPRW_Engine:
         noise_np = noise[0].cpu().numpy()
         return (norm.cdf(noise_np) > 0.5).astype(np.uint8).flatten()
 
-    def _embed_bits(self, binary: torch.Tensor, bits: str, window_size: int) -> torch.Tensor:
+    # old but works fine, which works on cpu
+    def _embed_bits_cpu(self, binary: np.ndarray, bits: str, window_size: int) -> np.ndarray:
+        if isinstance(binary, torch.Tensor):
+            binary = binary.cpu().numpy()
+        binary = binary.copy()
+        for i in range(0, len(binary), window_size):
+            window_end = min(i + window_size, len(binary))
+            window_sum = np.sum(binary[i:window_end])
+            bit_idx = i // window_size
+            if bit_idx < len(bits):
+                target_parity = int(bits[bit_idx])
+                if window_sum % 2 != target_parity:
+                    mid_idx = i + (window_end - i) // 2
+                    if mid_idx < len(binary):
+                        binary[mid_idx] = 1 - binary[mid_idx]
+        return binary
+
+    def _embed_bits_gpu(self, binary: torch.Tensor, bits: str, window_size: int) -> torch.Tensor:
+        """嵌入水印位（完全向量化，GPU 上）"""
         binary = torch.from_numpy(binary).clone().to(self.device)
         num_windows = len(binary) // window_size
         bits_tensor = torch.tensor([int(b) for b in bits[:num_windows]], dtype=torch.uint8, device=self.device)
@@ -146,30 +164,83 @@ class DPRW_Engine:
         flip_indices = (torch.arange(num_windows, device=self.device) * window_size + mid_idx)[flip_mask]
         binary[flip_indices] = 1 - binary[flip_indices]
         return binary
+    
+    # works fine on both cpu and gpu
+    def _embed_bits(self, binary: torch.Tensor, bits: str, window_size: int) -> torch.Tensor:
+        if self.device.type == 'cpu':
+            self.logger.info("Embedding bits on CPU")
+            return self._embed_bits_cpu(binary, bits, window_size)
+        elif self.device.type == 'cuda':
+            self.logger.info("Embedding bits on GPU")
+            return self._embed_bits_gpu(binary, bits, window_size)
 
-    def _restore_noise(self, binary: torch.Tensor, shape: Tuple[int, ...],fix_batchsize:int =1, check_gaussian: bool = False) -> torch.Tensor:
+    def _Gaussian_test(self, noise: torch.Tensor) -> None:
+        if isinstance(noise, torch.Tensor):
+            noise = noise.cpu().numpy()
+        samples = noise.flatten()
+        _, p_value = kstest(samples, 'norm', args=(0, 1))
+        if np.isnan(samples).any() or np.isinf(samples).any():
+            raise ValueError("Restored noise contains NaN or Inf values")
+        if np.var(samples) == 0:
+            raise ValueError("Restored noise variance is 0")
+        if p_value < 0.05:
+            raise ValueError(f"Restored noise failed Gaussian test (p={p_value:.4f})")
+        self.logger.info(f"Gaussian test passed: p={p_value:.4f}")
+
+    # old method which works on cpu and works fine
+    def _restore_noise_cpu(self, binary: np.ndarray, shape: Tuple[int, ...], check_gaussian: bool = True) -> torch.Tensor:
+        if isinstance(binary, torch.Tensor):
+            binary = binary.cpu().numpy()
+        noise_np = self.init_noise.clone().cpu().numpy()[0] 
+        binary_reshaped = binary.reshape(4, shape[2], shape[3])
+        original_binary = (norm.cdf(noise_np) > 0.5).astype(np.uint8)
+
+        for c in range(4):
+            for h in range(shape[2]):
+                for w in range(shape[3]):
+                    binary_value = binary_reshaped[c, h, w]
+                    original_binary_value = original_binary[c, h, w]
+                    if binary_value != original_binary_value:
+                        u = self.rng.uniform(0, 0.5 - 1e-8) if self.use_seed else np.random.uniform(0, 0.5 - 1e-8)
+                        theta = u + binary_value * 0.5
+                        noise_np[c, h, w] = norm.ppf(theta)
+        res = torch.tensor(noise_np, dtype=self.dtype, device=self.device).unsqueeze(0)
+        if check_gaussian:
+            self._Gaussian_test(res)
+        return res
+
+    def _restore_noise_gpu(self, binary: torch.Tensor, shape: Tuple[int, ...], check_gaussian: bool = True) -> torch.Tensor:
         noise = self.init_noise.clone().to(self.device)
         binary_reshaped = binary.view(4, shape[2], shape[3])
-        original_binary = (torch.sigmoid(noise) > 0.5).to(torch.uint8)
+        noise_fp32 = noise.to(torch.float32)
+        original_binary = (torch.sigmoid(noise_fp32) > 0.5).to(torch.uint8)
         mask = binary_reshaped != original_binary
-        u = torch.rand_like(noise, device=self.device) * 0.5
+        u = torch.rand_like(noise_fp32, device=self.device) * 0.5
         theta = u + binary_reshaped.float() * 0.5
-        noise[mask] = torch.erfinv(2 * theta[mask] - 1).to(noise.dtype) * torch.sqrt(torch.tensor(2.0, device=self.device,dtype=noise.dtype))
+        adjustment = torch.erfinv(2 * theta[mask] - 1) * torch.sqrt(torch.tensor(2.0, device=self.device, dtype=torch.float32))
+        noise_fp32[mask] = adjustment
+        noise = noise_fp32.to(self.dtype)
         if check_gaussian:
-            samples = noise.flatten().cpu().numpy()
-            _, p_value = kstest(samples, 'norm', args=(0, 1))
-            if p_value < 0.05:
-                self.logger.warning(f"Restored noise failed Gaussian test (p={p_value:.4f})")
+            self._Gaussian_test(noise)
+        
         return noise
+    
+    # works fine on both cpu and gpu
+    def _restore_noise(self, binary: torch.Tensor, shape: Tuple[int, ...], check_gaussian: bool = True) -> torch.Tensor:
+        if self.device.type == 'cpu':
+            self.logger.info("Restoring noise on CPU")
+            return self._restore_noise_cpu(binary, shape)
+        elif self.device.type == 'cuda':
+            self.logger.info("Restoring noise on GPU")
+            return self._restore_noise_gpu(binary, shape, check_gaussian)
 
-    def embed_watermark(self, noise: torch.Tensor, message: str, message_length: int = 256, window_size: int = 1,fix_batchsize:int=1) -> Tuple[torch.Tensor, List[bytes]]:
+    def get_embed_watermark(self, noise: torch.Tensor, message: str, message_length: int = 256, window_size: int = 1,fix_batchsize:int=1) -> Tuple[torch.Tensor, List[bytes]]:
         total_blocks = noise.numel() // (noise.shape[0] * window_size)
         watermark = self._create_watermark(total_blocks, message, message_length)
         encrypted_bits = self._encrypt(watermark)
         binary = self._binarize_noise(noise)
         binary_embedded = self._embed_bits(binary, encrypted_bits, window_size)
-        restored_noise = self._restore_noise(binary_embedded, noise.shape,fix_batchsize)
-        
+        restored_noise = self._restore_noise(binary_embedded, noise.shape)
         
         return restored_noise
 
@@ -178,15 +249,30 @@ class DPRW_Engine:
         decryptor = cipher.decryptor()
         return decryptor.update(encrypted) + decryptor.finalize()
 
-    def extract_watermark(self, noise: torch.Tensor, message_length: int, window_size: int) -> Tuple[str, str]:
+    # cpu version
+    def extract_watermark_cpu(self, noise: torch.Tensor, message_length: int, window_size: int) -> Tuple[str, str]:
+        binary = (norm.cdf(noise.cpu().numpy()) > 0.5).astype(np.uint8).flatten()
+        bits = [str(int(np.sum(binary[i:i + window_size]) % 2)) 
+                for i in range(0, len(binary), window_size)]
+        bit_str = ''.join(bits)
+        byte_data = bytes(int(bit_str[i:i + 8], 2) for i in range(0, len(bit_str) - 7, 8))
+        decrypted = self._decrypt(byte_data)
+        all_bits = ''.join(format(byte, '08b') for byte in decrypted)
+        segments = [all_bits[i:i + message_length] for i in range(0, len(all_bits) - message_length + 1, message_length)]
+        msg_bin = ''.join('1' if sum(s[i] == '1' for s in segments) > len(segments) / 2 else '0' 
+                          for i in range(message_length))
+        msg = bytes(int(msg_bin[i:i + 8], 2) for i in range(0, len(msg_bin), 8)).decode('utf-8', errors='replace')
+        return msg_bin, msg
+    
+    # gpu version
+    def extract_watermark_gpu(self, noise: torch.Tensor, message_length: int, window_size: int) -> Tuple[str, str]:
         noise = noise.to(self.device) 
-        binary = (torch.sigmoid(noise) > 0.5).to(torch.uint8).flatten()
-
+        binary = (torch.sigmoid(noise) > 0.5).to(torch.uint8).flatten() 
 
         num_windows = len(binary) // window_size
         windows = binary[:num_windows * window_size].view(num_windows, window_size)
         window_sums = windows.sum(dim=1) % 2 
-        bits = window_sums.cpu().numpy().astype(str).tolist()
+        bits = window_sums.cpu().numpy().astype(str).tolist()  
 
         bit_str = ''.join(bits)
         byte_data = bytes(int(bit_str[i:i + 8], 2) for i in range(0, len(bit_str) - 7, 8))
@@ -199,6 +285,15 @@ class DPRW_Engine:
         
         return msg_bin, msg
     
+    # works fine on both cpu and gpu
+    def extract_watermark(self, noise: torch.Tensor, message_length: int, window_size: int) -> Tuple[str, str]:
+        if self.device.type == 'cpu':
+            self.logger.info("Extracting watermark on CPU")
+            return self.extract_watermark_cpu(noise, message_length, window_size)
+        elif self.device.type == 'cuda':
+            self.logger.info("Extracting watermark on GPU")
+            return self.extract_watermark_gpu(noise, message_length, window_size)
+
     def evaluate_accuracy(self, original_msg: str, extracted_bin: str,msg_str:str) -> float:
         orig_bin = bin(int(original_msg.encode('utf-8').hex(), 16))[2:].zfill(len(original_msg) * 8)
         min_len = min(len(orig_bin), len(extracted_bin))
@@ -219,7 +314,7 @@ class DPRW_Engine:
         latent_height, latent_width = height // 8, width // 8
         self.init_noise = torch.randn(1, 4, latent_height, latent_width, device=self.device, dtype=self.dtype)
 
-        watermarked_noise = self.embed_watermark(self.init_noise, message, message_length, window_size, fix_batchsize)
+        watermarked_noise = self.get_embed_watermark(self.init_noise, message, message_length, window_size, fix_batchsize)
 
         image = pipe(
             prompt=prompt,
@@ -340,43 +435,3 @@ class DPRW_Engine:
         file.write(f"Num Inference Steps, {num_steps}\n")
         file.write(f"Scheduler, {self.scheduler_type}\n")
         file.write("=" * 40 + "Batch Start" + "=" * 40 + "\n")
-
-def example_usage():
-    engine = DPRW_Engine(
-        # digiplay/majicMIX_realistic_v7
-        # stabilityai/stable-diffusion-2-1-base
-        model_id="digiplay/majicMIX_realistic_v7",
-        scheduler_type="DDIM",
-        key_hex="5822ff9cce6772f714192f43863f6bad1bf54b78326973897e6b66c3186b77a7",
-        nonce_hex="05072fd1c2265f6f2e2a4080a2bfbdd8",
-        use_seed=True,
-        random_seed=42,
-        device="cuda" 
-    )
-    fix_batchsize = 1
-    message = "5822ff9cce6772f714192f43863f6bad1bf54b78326973897e6b66c3186b77a75822ff9cce6772f714192f43863f6bad1bf54b78326973897e6b66c3186b77a7"
-    width, height = 1024, 1024
-    # you can set message_length to 0 to use the default value of 128
-    message_length = len(message)*8
-    window_size = 1
-    num_steps = 30
-    generated_image_path = "output/generated_image.png"
-
-    prompt = "A girl in a white sweater at Times Square"
-    engine.generate_image(
-        prompt=prompt, width=width, height=height, num_steps=num_steps,
-        message=message, message_length=message_length, window_size=window_size,fix_batchsize=1,
-        output_path=generated_image_path
-    )
-
-    reversed_latents = engine.invert_image(generated_image_path, width=width, 
-                                           height=height, 
-                                           num_steps=num_steps, 
-                                           guidance_scale=7.5)
-    extracted_bin, extracted_msg = engine.extract_watermark(reversed_latents, 
-                                                            message_length=message_length, 
-                                                            window_size=window_size)
-    accuracy = engine.evaluate_accuracy(message, extracted_bin,extracted_msg)
-
-if __name__ == "__main__":
-    example_usage()
