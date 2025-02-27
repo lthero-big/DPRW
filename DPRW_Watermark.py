@@ -19,7 +19,7 @@ import logging
 class Loggers:
     """日志管理类，单例模式"""
     _logger = None
-
+    
     @classmethod
     def get_logger(cls, log_dir: str = './logs') -> 'logging.Logger':
         if cls._logger is None:
@@ -50,11 +50,12 @@ class WatermarkUtils:
 class DPRW_Engine:
     """DPRW 水印引擎，整合嵌入、提取、评估、图像生成和逆向功能"""
     def __init__(self, model_id: str = 'stabilityai/stable-diffusion-2-1-base', scheduler_type: str = 'DDIM',
-                 key_hex: Optional[str] = None, nonce_hex: Optional[str] = None,
-                 use_seed: bool = False, random_seed: int = 42, device: str = 'cuda',
-                 dtype: torch.dtype = torch.float16, solver_order: int = 2, inv_order: int = 0,
-                 log_dir: str = './logs'):
+                    key_hex: Optional[str] = None, nonce_hex: Optional[str] = None,
+                    use_seed: bool = False, random_seed: int = 42, device: str = 'cuda',turnoffWatermark=False,
+                    watermarkoncpu:bool=False,dtype: torch.dtype = torch.float16, solver_order: int = 2, inv_order: int = 0,
+                    seed_mode: str = 'sequential', log_dir: str = './logs'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.watermarkoncpu=watermarkoncpu
         self.dtype = dtype
         self.logger = Loggers.get_logger(log_dir)
         self.model_id = model_id
@@ -63,8 +64,10 @@ class DPRW_Engine:
         self.inv_order = inv_order
         self.use_seed = use_seed
         self.random_seed = random_seed
+        self.seed_mode = seed_mode  # 新增参数：'sequential' 或 'random'
         self.rng = np.random.RandomState(random_seed) if use_seed else np.random
         self.key, self.nonce = self._init_crypto(key_hex, nonce_hex)
+        self.turnoffWatermark:bool = turnoffWatermark
         self.logger.info(f"Initialized - DPRW Engine with model: {model_id}")
         self.logger.info(f"Initialized - Scheduler: {scheduler_type}")
         self.logger.info(f"Initialized - Key: {self.key.hex()}")
@@ -181,7 +184,7 @@ class DPRW_Engine:
     
     # works fine on both cpu and gpu
     def _embed_bits(self, binary: torch.Tensor, bits: str, window_size: int) -> torch.Tensor:
-        if self.device.type == 'cpu':
+        if self.device.type == 'cpu' or self.watermarkoncpu:
             self.logger.info("Embedding bits on CPU")
             return self._embed_bits_cpu(binary, bits, window_size)
         elif self.device.type == 'cuda':
@@ -224,25 +227,25 @@ class DPRW_Engine:
         if check_gaussian:
             self._Gaussian_test(res)
         return res
-
+        
+    #     return noise
     def _restore_noise_gpu(self, binary: torch.Tensor, shape: Tuple[int, ...], check_gaussian: bool = True) -> torch.Tensor:
-        # 复制初始噪声并移到 GPU
         noise = self.init_noise.clone().to(self.device)
         binary_reshaped = binary.view(4, shape[2], shape[3])
-        # 使用 float32 进行 sigmoid 和二值化
         noise_fp32 = noise.to(torch.float32)
         original_binary = (torch.sigmoid(noise_fp32) > 0.5).to(torch.uint8)
-        # 生成掩码
         mask = binary_reshaped != original_binary
-        # 生成均匀分布并计算 theta
+        
+        # 设置随机种子并生成随机数 u
+        # if self.use_seed:
+        #     torch.manual_seed(self.random_seed)
         u = torch.rand_like(noise_fp32, device=self.device) * 0.5
+        
         theta = u + binary_reshaped.float() * 0.5
-        # 使用 float32 计算噪声调整
         adjustment = torch.erfinv(2 * theta[mask] - 1) * torch.sqrt(torch.tensor(2.0, device=self.device, dtype=torch.float32))
         noise_fp32[mask] = adjustment
-        # 转换回原始 dtype（float16）
         noise = noise_fp32.to(self.dtype)
-        # 高斯检验
+        
         if check_gaussian:
             self._Gaussian_test(noise)
         
@@ -250,14 +253,14 @@ class DPRW_Engine:
     
     # works fine on both cpu and gpu
     def _restore_noise(self, binary: torch.Tensor, shape: Tuple[int, ...], check_gaussian: bool = True) -> torch.Tensor:
-        if self.device.type == 'cpu':
+        if self.device.type == 'cpu' or self.watermarkoncpu:
             self.logger.info("Restoring noise on CPU")
             return self._restore_noise_cpu(binary, shape)
         elif self.device.type == 'cuda':
             self.logger.info("Restoring noise on GPU")
             return self._restore_noise_gpu(binary, shape, check_gaussian)
 
-    def get_embed_watermark(self, noise: torch.Tensor, message: str, message_length: int = 256, window_size: int = 1,fix_batchsize:int=1) -> Tuple[torch.Tensor, List[bytes]]:
+    def get_embed_watermark(self, noise: torch.Tensor, message: str, message_length: int = 256, window_size: int = 1,batchsize:int=1) -> Tuple[torch.Tensor, List[bytes]]:
         """嵌入水印"""
         total_blocks = noise.numel() // (noise.shape[0] * window_size)
         watermark = self._create_watermark(total_blocks, message, message_length)
@@ -340,35 +343,48 @@ class DPRW_Engine:
 
     def generate_image(self, prompt: str, width: int, height: int, num_steps: int, 
                        message: str, message_length: int = 256, window_size: int = 1, 
-                       fix_batchsize: int = 1, output_path: str = "generated_image.png") -> None:
+                       batchsize: int = 1, output_path: str = "generated_image.png") -> None:
         """生成带水印的图像"""
         # 创建带有 DPMS 调度器的管道
         pipe = self._create_pipeline("DPMS")
-        # 初始化噪声
         latent_height, latent_width = height // 8, width // 8
-        self.init_noise = torch.randn(1, 4, latent_height, latent_width, device=self.device, dtype=self.dtype)
-        # 嵌入水印
-        watermarked_noise = self.get_embed_watermark(self.init_noise, message, message_length, window_size, fix_batchsize)
-        # 生成图像
-        image = pipe(
-            prompt=prompt,
-            latents=watermarked_noise,
-            height=height,
-            width=width,
-            num_inference_steps=num_steps,
-            guidance_scale=7.5,
-            output_type='pil'
-        ).images[0]
-        # 保存图像
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        image.save(output_path)
-        self.logger.info(f"Generation - Generated image saved to {output_path}")
+        # 设置初始随机种子
+        for i in range(batchsize):
+            if self.use_seed and self.seed_mode == 'sequential':
+                self.random_seed=self.random_seed + i
+            elif self.use_seed and self.seed_mode == 'random':
+                self.random_seed=self.random_seed + np.random.randint(0, 1000000)
+            if self.use_seed:
+                torch.manual_seed(self.random_seed)
+            self.logger.info(f"Generation - Random seed: {self.random_seed}")
+            # 初始化噪声
+            self.init_noise = torch.randn(1, 4, latent_height, latent_width, device=self.device, dtype=self.dtype)
+            # 嵌入水印
+            if self.turnoffWatermark:
+                watermarked_noise = self.init_noise
+            else:
+                watermarked_noise = self.get_embed_watermark(self.init_noise, message, message_length, window_size, batchsize)
+            # 生成图像
+            image = pipe(
+                prompt=prompt,
+                latents=watermarked_noise,
+                height=height,
+                width=width,
+                num_inference_steps=num_steps,
+                guidance_scale=7.5,
+                output_type='pil'
+            ).images[0]
+            # 保存图像
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            image.save(f"{output_path.replace('.png', f'_{i}.png')}")
+            self.logger.info(f"Generation - Generated image saved to {output_path}")
 
         # 释放管道资源
         del pipe
         torch.cuda.empty_cache()
 
         return 
+
     
     def invert_image(self, image_path: str, width: int, height: int, num_steps: int, guidance_scale: float = 1.0) -> torch.Tensor:
         """逆向生成潜在表示以提取水印"""
@@ -403,7 +419,7 @@ class DPRW_Engine:
 
     # 批量处理方法
     def process_single_image(self, image_path: str, message_length: int, window_size: int, threshold: float, 
-                            original_msg: str,original_msg_hex: str, width: int, height: int, num_steps: int, guidance_scale: float) -> dict:
+                            original_msg: str, width: int, height: int, num_steps: int, guidance_scale: float) -> dict:
         """处理单张图像"""
         latents = self.invert_image(image_path, width, height, num_steps, guidance_scale)
         extracted_bin, extracted_msg = self.extract_watermark(latents, message_length, window_size)
@@ -417,24 +433,24 @@ class DPRW_Engine:
         return result
 
     def process_directory(self, dir_path: str, message_length: int, window_size: int, threshold: float, 
-                          original_msg:str,original_msg_hex: str, width: int, height: int, num_steps: int, guidance_scale: float,
+                          original_msg:str, width: int, height: int, num_steps: int, guidance_scale: float,
                           traverse_subdirs: bool = False):
         """处理目录或递归处理子目录"""
         if traverse_subdirs:
             with open(os.path.join(dir_path, "result.txt"), "a") as root_file:
-                self._write_batch_info(root_file, original_msg_hex, num_steps)
+                self._write_batch_info(root_file,  num_steps)
             for root, dirs, _ in os.walk(dir_path):
                 for subdir in dirs:
                     self._process_single_directory(os.path.join(root, subdir), message_length, window_size, threshold, 
-                                                  original_msg,original_msg_hex, width, height, num_steps, guidance_scale)
+                                                  original_msg, width, height, num_steps, guidance_scale)
             with open(os.path.join(dir_path, "result.txt"), "a") as root_file:
                 root_file.write("=" * 40 + "Batch End" + "=" * 40 + "\n\n")
         else:
-            self._process_single_directory(dir_path, message_length, window_size, threshold,original_msg, original_msg_hex, 
+            self._process_single_directory(dir_path, message_length, window_size, threshold,original_msg,  
                                           width, height, num_steps, guidance_scale)
 
     def _process_single_directory(self, dir_path: str, message_length: int, window_size: int, threshold: float, 
-                                  original_msg: str,original_msg_hex: str, width: int, height: int, num_steps: int, guidance_scale: float):
+                                  original_msg: str, width: int, height: int, num_steps: int, guidance_scale: float):
         """处理单个目录"""
         image_files = glob.glob(os.path.join(dir_path, "*.png")) + glob.glob(os.path.join(dir_path, "*.jpg"))
         if not image_files:
@@ -442,14 +458,13 @@ class DPRW_Engine:
 
         result_file_path = os.path.join(dir_path, "result.txt")
         with open(result_file_path, "a") as result_file:
-            self._write_batch_info(result_file, original_msg_hex, num_steps)
+            self._write_batch_info(result_file,  num_steps)
             total_bit_accuracy, recognized_count, processed_count = 0, 0, 0
 
             for image_path in tqdm(image_files):
                 try:
                     result = self.process_single_image(image_path, message_length, window_size, threshold, original_msg,
-                                                      original_msg_hex, width, height, num_steps, guidance_scale)
-                    recognized_count += result["is_recognized"]
+                                                      width, height, num_steps, guidance_scale)
                     total_bit_accuracy += result["bit_accuracy"]
                     result_file.write(f"{os.path.basename(image_path)}, Bit Accuracy, {result['bit_accuracy']}\n")
                     processed_count += 1
@@ -461,22 +476,20 @@ class DPRW_Engine:
                 avg_bit_accuracy = total_bit_accuracy / processed_count
                 identification_accuracy = recognized_count / processed_count
 
-                self.logger.info(f"Batch processing completed. {image_path} Avg Bit Accuracy: {avg_bit_accuracy}, Identification Accuracy: {identification_accuracy}")
+                self.logger.info(f"Batch processing completed. {image_path} Avg Bit Accuracy: {avg_bit_accuracy}")
                 result_file.write(f"Average Bit Accuracy, {avg_bit_accuracy}\n")
-                result_file.write(f"Identification Accuracy, {identification_accuracy}\n")
                 result_file.write("=" * 40 + "Batch End" + "=" * 40 + "\n")
 
                 parent_dir = os.path.dirname(dir_path)
                 with open(os.path.join(parent_dir, "result.txt"), "a") as parent_file:
-                    parent_file.write(f"{os.path.basename(dir_path)}, Avg Bit Accuracy, {avg_bit_accuracy}, Identification Accuracy, {identification_accuracy}\n")
+                    parent_file.write(f"{os.path.basename(dir_path)}, Avg Bit Accuracy, {avg_bit_accuracy}\n")
 
-    def _write_batch_info(self, file, original_msg_hex: str, num_steps: int):
+    def _write_batch_info(self, file,  num_steps: int):
         """写入批次信息"""
         file.write("=" * 40 + "Batch Info" + "=" * 40 + "\n")
         file.write(f"Time, {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         file.write(f"Key Hex, {self.key.hex()}\n")
         file.write(f"Nonce Hex, {self.nonce.hex()}\n")
-        file.write(f"Original Message Hex, {original_msg_hex}\n")
         file.write(f"Num Inference Steps, {num_steps}\n")
         file.write(f"Scheduler, {self.scheduler_type}\n")
         file.write("=" * 40 + "Batch Start" + "=" * 40 + "\n")
