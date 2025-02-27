@@ -3,7 +3,11 @@
 This repository provides the reference implementation of the paper *"Diversity-Preserving Robust Watermarking for Diffusion Model Generated Images"*. 
 
 
+## Comfyui-nodes
 
+Support for Comfyui
+
+[https://github.com/lthero-big/Comfyui-DPRWatermark](https://github.com/lthero-big/Comfyui-DPRWatermark)
 
 ## Usage
 The DPRW Engine provides three main functionalities:
