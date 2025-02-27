@@ -96,21 +96,20 @@ engine.process_directory(
 
 ## Parameters
 
-* model_id: Identifier of the diffusion model (e.g., "stabilityai/stable-diffusion-2-1-base").
-* scheduler_type: Scheduler type ('DPMS', 'DDIM', 'DDIMInverse').
-* key_hex: 64-character hexadecimal string for encryption.
-* nonce_hex: 32-character hexadecimal string for encryption.
-* use_seed: Boolean to use a fixed seed for reproducibility.
-* random_seed: Integer seed value if use_seed is True.
-* seed_mode: Seed handling in batch processing ('sequential' or 'random').
-* device: Computation device ('cuda' or 'cpu').
-* turnoffWatermark: If True, disables watermark embedding.
-* watermarkoncpu: If True, performs watermark operations on CPU.
-* dtype: Tensor data type (e.g., torch.float32).
-* message: Watermark message to embed.
-* message_length: Bit length of the watermark message.
-* window_size: Window size for watermark embedding and extraction.
-* threshold: Accuracy threshold for watermark extraction in batch processing.
+* `model_id`: Identifier of the diffusion model (e.g., "stabilityai/stable-diffusion-2-1-base").
+* `scheduler_type`: Scheduler type ('DPMS', 'DDIM', 'DDIMInverse').
+* `key_hex`: 64-character hexadecimal string for encryption.
+* `nonce_hex`: 32-character hexadecimal string for encryption.
+* `use_seed`: Boolean to use a fixed seed for reproducibility.
+* `random_seed`: Integer seed value if use_seed is True.
+* `seed_mode`: Seed handling in batch processing ('sequential' or 'random').
+* `device`: Computation device ('cuda' or 'cpu').
+* `turnoffWatermark`: If True, disables watermark embedding.
+* `watermarkoncpu`: If True, performs watermark operations on CPU.
+* `dtype`: Tensor data type (e.g., torch.float16 ,torch.float32).
+* `message`: Watermark message to embed.
+* `message_length`: Bit length of the watermark message.
+* `window_size`: Window size for watermark embedding and extraction.
 
 
 ## Examples
