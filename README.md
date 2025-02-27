@@ -5,9 +5,7 @@ This repository provides the reference implementation of the paper *"Diversity-P
 
 ## Comfyui-nodes
 
-Support for Comfyui
-
-[https://github.com/lthero-big/Comfyui-DPRWatermark](https://github.com/lthero-big/Comfyui-DPRWatermark)
+Support for Comfyui [https://github.com/lthero-big/Comfyui-DPRWatermark](https://github.com/lthero-big/Comfyui-DPRWatermark)
 
 ## Usage
 The DPRW Engine provides three main functionalities:
